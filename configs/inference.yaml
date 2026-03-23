@@ -1,0 +1,28 @@
+method: both
+every_n_frames: 1
+min_track_hits: 2
+
+classical:
+  min_area: 4
+  max_area: 400
+  motion_threshold: 18
+  color_threshold: 120
+  max_aspect_ratio: 4.0
+
+yolo:
+  model_path: yolo11n.pt
+  tile_size: 640
+  tile_overlap: 160
+  imgsz: 640
+  conf: 0.15
+  iou: 0.45
+  max_det: 50
+  allowed_class_ids: null
+
+tracker:
+  max_match_distance: 80.0
+  min_iou_for_match: 0.01
+  max_missed_frames: 8
+  static_center_threshold: 4.0
+  static_iou_threshold: 0.92
+  static_frame_window: 8
