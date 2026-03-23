@@ -12,7 +12,7 @@ if str(ROOT_DIR) not in sys.path:
 import yaml
 from tqdm import tqdm
 
-from src.detector import ClassicalDroneDetector, Detection, YoloTileDetector, non_max_suppression
+from src.detector import ClassicalDroneDetector, Detection, non_max_suppression
 from src.postprocess import filter_useful_tracks
 from src.tracker import SimpleTracker
 from src.video_io import create_video_writer, get_video_metadata, iter_video_frames
@@ -24,13 +24,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Path to input video")
     parser.add_argument("--config", default="configs/inference.yaml", help="Path to YAML config")
     parser.add_argument(
-        "--method",
-        choices=["classical", "yolo", "both"],
-        default=None,
-        help="Override detector method from config",
+        "--output-dir",
+        default="outputs",
+        help="Output directory",
     )
-    parser.add_argument("--output-dir", default="outputs", help="Output directory")
+    parser.add_argument(
+        "--background-alpha",
+        type=float,
+        default=None,
+        help="Override detector background update rate in (0, 1]. Bigger values forget old frames faster.",
+    )
+    parser.add_argument(
+        "--use-cone-filter",
+        action="store_true",
+        help="Enable simple predicted-position cone filter in tracker.",
+    )
+    parser.add_argument(
+        "--disable-cone-filter",
+        action="store_true",
+        help="Force-disable the cone filter even if it is enabled in config.",
+    )
     return parser.parse_args()
+
 
 
 def load_config(config_path: str | Path) -> dict:
@@ -38,15 +53,13 @@ def load_config(config_path: str | Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def build_detectors(config: dict, method: str) -> list:
-    detectors = []
-    if method in {"classical", "both"}:
-        classical_cfg = config.get("classical", {})
-        detectors.append(ClassicalDroneDetector(**classical_cfg))
-    if method in {"yolo", "both"}:
-        yolo_cfg = config.get("yolo", {})
-        detectors.append(YoloTileDetector(**yolo_cfg))
-    return detectors
+
+def build_detector(config: dict, background_alpha_override: float | None) -> ClassicalDroneDetector:
+    classical_cfg = dict(config.get("classical", {}))
+    if background_alpha_override is not None:
+        classical_cfg["background_alpha"] = background_alpha_override
+    return ClassicalDroneDetector(**classical_cfg)
+
 
 
 def merge_detections(detections: list[Detection]) -> list[Detection]:
@@ -55,18 +68,29 @@ def merge_detections(detections: list[Detection]) -> list[Detection]:
     return non_max_suppression(detections, iou_threshold=0.3)
 
 
+
+def resolve_tracker_config(config: dict, args: argparse.Namespace) -> dict:
+    tracker_cfg = dict(config.get("tracker", {}))
+    if args.use_cone_filter:
+        tracker_cfg["use_cone_filter"] = True
+    if args.disable_cone_filter:
+        tracker_cfg["use_cone_filter"] = False
+    return tracker_cfg
+
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    method = args.method or config.get("method", "both")
+    method = "classical"
 
     metadata = get_video_metadata(args.video)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     video_stem = Path(args.video).stem
 
-    detectors = build_detectors(config, method)
-    tracker_cfg = config.get("tracker", {})
+    detector = build_detector(config, args.background_alpha)
+    tracker_cfg = resolve_tracker_config(config, args)
     tracker = SimpleTracker(**tracker_cfg)
 
     annotated_video_path = output_dir / f"{video_stem}_{method}_annotated.mp4"
@@ -85,12 +109,9 @@ def main() -> None:
         for frame_idx, frame in tqdm(
             iter_video_frames(args.video, every_n_frames=every_n_frames),
             total=metadata["frame_count"] // every_n_frames if metadata["frame_count"] else None,
-            desc=f"Running {method} inference",
+            desc="Running classical inference",
         ):
-            detections: list[Detection] = []
-            for detector in detectors:
-                detections.extend(detector.detect(frame))
-
+            detections = detector.detect(frame)
             merged = merge_detections(detections)
             tracks = tracker.update(merged)
             useful_tracks = filter_useful_tracks(tracks, min_hits=config.get("min_track_hits", 2))
@@ -107,6 +128,12 @@ def main() -> None:
             "method": method,
             "metadata": metadata,
             "frames": frames_payload,
+            "classical": {
+                "background_alpha": detector.background_alpha,
+            },
+            "tracker": {
+                "use_cone_filter": tracker.use_cone_filter,
+            },
         },
         json_path,
     )

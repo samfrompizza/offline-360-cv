@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Iterable, Sequence
+from typing import Iterable
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
-
-from src.tiling import Tile, split_into_tiles, tile_to_global_bbox
 
 
 @dataclass
@@ -42,14 +39,14 @@ class Detection:
 
 class ClassicalDroneDetector:
     """
-    Простая классическая детекция маленьких движущихся контрастных объектов.
+    Классическая детекция маленьких движущихся контрастных объектов.
 
-    Идея MVP:
-    - ищем движение через разность с предыдущим кадром;
-    - усиливаем маленькие яркие/цветные объекты;
-    - отсекаем слишком большие и слишком маленькие компоненты.
-
-    Это помогает отделить дроны от статичных цветных ворот.
+    Основная идея:
+    - строим простой фон через exponential moving average;
+    - выделяем отличия от фона, а не только от предыдущего кадра;
+    - обновляем фон с настраиваемой скоростью, чтобы алгоритм быстрее
+      "забывал" старые следы;
+    - дополнительно оставляем только яркие/насыщенные небольшие компоненты.
     """
 
     def __init__(
@@ -59,25 +56,38 @@ class ClassicalDroneDetector:
         motion_threshold: int = 18,
         color_threshold: int = 120,
         max_aspect_ratio: float = 4.0,
+        background_alpha: float = 0.35,
+        morph_kernel_size: int = 3,
+        dilate_iterations: int = 0,
     ) -> None:
+        if not 0.0 < background_alpha <= 1.0:
+            raise ValueError("background_alpha must be in (0, 1]")
+        if morph_kernel_size < 1:
+            raise ValueError("morph_kernel_size must be >= 1")
+        if dilate_iterations < 0:
+            raise ValueError("dilate_iterations must be >= 0")
+
         self.min_area = min_area
         self.max_area = max_area
         self.motion_threshold = motion_threshold
         self.color_threshold = color_threshold
         self.max_aspect_ratio = max_aspect_ratio
-        self._prev_gray: np.ndarray | None = None
+        self.background_alpha = background_alpha
+        self.morph_kernel_size = morph_kernel_size
+        self.dilate_iterations = dilate_iterations
+        self._background: np.ndarray | None = None
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
         detections: list[Detection] = []
 
-        if self._prev_gray is None:
-            self._prev_gray = gray
+        if self._background is None:
+            self._background = gray_blur.astype(np.float32)
             return detections
 
-        prev_blur = cv2.GaussianBlur(self._prev_gray, (5, 5), 0)
-        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        diff = cv2.absdiff(gray_blur, prev_blur)
+        background = cv2.convertScaleAbs(self._background)
+        diff = cv2.absdiff(gray_blur, background)
         _, motion_mask = cv2.threshold(diff, self.motion_threshold, 255, cv2.THRESH_BINARY)
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -87,12 +97,13 @@ class ClassicalDroneDetector:
         bright_mask = cv2.inRange(value, self.color_threshold, 255)
         combined = cv2.bitwise_and(motion_mask, cv2.bitwise_or(color_mask, bright_mask))
 
-        kernel = np.ones((3, 3), np.uint8)
+        kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
-        combined = cv2.dilate(combined, kernel, iterations=1)
+        if self.dilate_iterations > 0:
+            combined = cv2.dilate(combined, kernel, iterations=self.dilate_iterations)
 
         contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        self._prev_gray = gray
+        cv2.accumulateWeighted(gray_blur, self._background, self.background_alpha)
 
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
@@ -106,9 +117,11 @@ class ClassicalDroneDetector:
 
             roi_motion = motion_mask[y : y + h, x : x + w]
             roi_color = color_mask[y : y + h, x : x + w]
+            roi_bright = bright_mask[y : y + h, x : x + w]
             motion_score = float(np.count_nonzero(roi_motion)) / float(area)
             color_score = float(np.count_nonzero(roi_color)) / float(area)
-            score = min(0.99, 0.45 + 0.35 * motion_score + 0.2 * color_score)
+            bright_score = float(np.count_nonzero(roi_bright)) / float(area)
+            score = min(0.99, 0.35 + 0.4 * motion_score + 0.15 * color_score + 0.1 * bright_score)
 
             detections.append(
                 Detection(
@@ -123,87 +136,6 @@ class ClassicalDroneDetector:
             )
 
         return non_max_suppression(detections, iou_threshold=0.25)
-
-
-class YoloTileDetector:
-    """
-    Baseline tile-by-tile inference для очень маленьких объектов на широком кадре.
-
-    Использует yolo11n.pt и автоматически скачивает веса через ultralytics,
-    если файла нет локально.
-    """
-
-    def __init__(
-        self,
-        model_path: str = "yolo11n.pt",
-        tile_size: int = 640,
-        tile_overlap: int = 160,
-        imgsz: int = 640,
-        conf: float = 0.15,
-        iou: float = 0.45,
-        max_det: int = 50,
-        allowed_class_ids: Sequence[int] | None = None,
-    ) -> None:
-        self.model_path = model_path
-        self.tile_size = tile_size
-        self.tile_overlap = tile_overlap
-        self.imgsz = imgsz
-        self.conf = conf
-        self.iou = iou
-        self.max_det = max_det
-        self.allowed_class_ids = list(allowed_class_ids) if allowed_class_ids else None
-        self.model = YOLO(model_path)
-
-    def detect(self, frame: np.ndarray) -> list[Detection]:
-        tiles = split_into_tiles(frame, tile_size=self.tile_size, overlap=self.tile_overlap)
-        detections: list[Detection] = []
-
-        for tile in tiles:
-            detections.extend(self._infer_tile(tile))
-
-        return non_max_suppression(detections, iou_threshold=0.35)
-
-    def _infer_tile(self, tile: Tile) -> list[Detection]:
-        results = self.model.predict(
-            source=tile.image,
-            imgsz=self.imgsz,
-            conf=self.conf,
-            iou=self.iou,
-            agnostic_nms=True,
-            verbose=False,
-            max_det=self.max_det,
-        )
-        if not results:
-            return []
-
-        result = results[0]
-        boxes = getattr(result, "boxes", None)
-        if boxes is None or boxes.xyxy is None:
-            return []
-
-        names = result.names
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy), dtype=float)
-        clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else np.zeros(len(xyxy), dtype=int)
-
-        detections: list[Detection] = []
-        for bbox, score, class_id in zip(xyxy, confs, clss):
-            if self.allowed_class_ids is not None and class_id not in self.allowed_class_ids:
-                continue
-
-            gx1, gy1, gx2, gy2 = tile_to_global_bbox(tuple(float(v) for v in bbox), tile)
-            detections.append(
-                Detection(
-                    x1=gx1,
-                    y1=gy1,
-                    x2=gx2,
-                    y2=gy2,
-                    score=float(score),
-                    label=str(names.get(class_id, class_id)),
-                    source="yolo",
-                )
-            )
-        return detections
 
 
 def iou(box_a: Detection, box_b: Detection) -> float:
@@ -222,6 +154,7 @@ def iou(box_a: Detection, box_b: Detection) -> float:
     if union <= 0:
         return 0.0
     return inter / union
+
 
 
 def non_max_suppression(
