@@ -1,1 +1,6 @@
 .venv
+data/frames/*jpg
+scripts/__pycache__/
+src/__pycache__/
+outputs
+yolo11n.pt

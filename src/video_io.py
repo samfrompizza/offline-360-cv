@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator, Optional, Tuple
+from typing import Iterator, Optional
 
 import cv2
 import numpy as np
@@ -72,6 +72,22 @@ def get_video_metadata(video_path: str | Path) -> dict:
         }
     finally:
         cap.release()
+
+
+def create_video_writer(
+    output_path: str | Path,
+    width: int,
+    height: int,
+    fps: float,
+) -> cv2.VideoWriter:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not create video writer: {output_path}")
+    return writer
 
 
 def save_frame(frame: np.ndarray, output_path: str | Path) -> None:
