@@ -1,13 +1,11 @@
 every_n_frames: 1
-min_track_hits: 2
+min_track_hits: 1
 
 classical:
-  min_area: 4
-  max_area: 400
-  motion_threshold: 18
-  color_threshold: 120
+  min_area: 20
+  max_area: 20000
+  color_threshold: 80
   max_aspect_ratio: 4.0
-  background_alpha: 0.35
   morph_kernel_size: 3
   dilate_iterations: 0
 

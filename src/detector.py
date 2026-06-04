@@ -39,29 +39,34 @@ class Detection:
 
 class ClassicalDroneDetector:
     """
-    Классическая детекция маленьких движущихся контрастных объектов.
+    Классическая детекция любых красных объектов.
 
     Основная идея:
-    - строим простой фон через exponential moving average;
-    - выделяем отличия от фона, а не только от предыдущего кадра;
-    - обновляем фон с настраиваемой скоростью, чтобы алгоритм быстрее
-      "забывал" старые следы;
-    - дополнительно оставляем только яркие/насыщенные небольшие компоненты.
+    - переводим кадр в HSV;
+    - оставляем только пиксели из красного HSV-диапазона;
+    - строим bounding boxes по компонентам маски без проверки движения.
     """
+
+    RED_HSV_RANGES = (
+        (
+            np.array([0, 80, 50], dtype=np.uint8),
+            np.array([10, 255, 255], dtype=np.uint8),
+        ),
+        (
+            np.array([170, 80, 50], dtype=np.uint8),
+            np.array([180, 255, 255], dtype=np.uint8),
+        ),
+    )
 
     def __init__(
         self,
         min_area: int = 4,
         max_area: int = 400,
-        motion_threshold: int = 18,
         color_threshold: int = 120,
         max_aspect_ratio: float = 4.0,
-        background_alpha: float = 0.35,
         morph_kernel_size: int = 3,
         dilate_iterations: int = 0,
     ) -> None:
-        if not 0.0 < background_alpha <= 1.0:
-            raise ValueError("background_alpha must be in (0, 1]")
         if morph_kernel_size < 1:
             raise ValueError("morph_kernel_size must be >= 1")
         if dilate_iterations < 0:
@@ -69,41 +74,23 @@ class ClassicalDroneDetector:
 
         self.min_area = min_area
         self.max_area = max_area
-        self.motion_threshold = motion_threshold
         self.color_threshold = color_threshold
         self.max_aspect_ratio = max_aspect_ratio
-        self.background_alpha = background_alpha
         self.morph_kernel_size = morph_kernel_size
         self.dilate_iterations = dilate_iterations
-        self._background: np.ndarray | None = None
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
         detections: list[Detection] = []
 
-        if self._background is None:
-            self._background = gray_blur.astype(np.float32)
-            return detections
-
-        background = cv2.convertScaleAbs(self._background)
-        diff = cv2.absdiff(gray_blur, background)
-        _, motion_mask = cv2.threshold(diff, self.motion_threshold, 255, cv2.THRESH_BINARY)
-
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        saturation = hsv[:, :, 1]
-        value = hsv[:, :, 2]
-        color_mask = cv2.inRange(saturation, self.color_threshold, 255)
-        bright_mask = cv2.inRange(value, self.color_threshold, 255)
-        combined = cv2.bitwise_and(motion_mask, cv2.bitwise_or(color_mask, bright_mask))
+        red_mask = self._build_red_mask(hsv)
 
         kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
         if self.dilate_iterations > 0:
-            combined = cv2.dilate(combined, kernel, iterations=self.dilate_iterations)
+            red_mask = cv2.dilate(red_mask, kernel, iterations=self.dilate_iterations)
 
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.accumulateWeighted(gray_blur, self._background, self.background_alpha)
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
@@ -115,13 +102,9 @@ class ClassicalDroneDetector:
             if aspect_ratio > self.max_aspect_ratio:
                 continue
 
-            roi_motion = motion_mask[y : y + h, x : x + w]
-            roi_color = color_mask[y : y + h, x : x + w]
-            roi_bright = bright_mask[y : y + h, x : x + w]
-            motion_score = float(np.count_nonzero(roi_motion)) / float(area)
-            color_score = float(np.count_nonzero(roi_color)) / float(area)
-            bright_score = float(np.count_nonzero(roi_bright)) / float(area)
-            score = min(0.99, 0.35 + 0.4 * motion_score + 0.15 * color_score + 0.1 * bright_score)
+            roi_red = red_mask[y : y + h, x : x + w]
+            red_score = float(np.count_nonzero(roi_red)) / float(area)
+            score = min(0.99, 0.5 + 0.5 * red_score)
 
             detections.append(
                 Detection(
@@ -130,12 +113,23 @@ class ClassicalDroneDetector:
                     x2=float(x + w),
                     y2=float(y + h),
                     score=score,
-                    label="drone_candidate",
+                    label="red_object",
                     source="classical",
                 )
             )
 
         return non_max_suppression(detections, iou_threshold=0.25)
+
+    def _build_red_mask(self, hsv: np.ndarray) -> np.ndarray:
+        masks = [cv2.inRange(hsv, lower, upper) for lower, upper in self.RED_HSV_RANGES]
+        red_mask = cv2.bitwise_or(masks[0], masks[1])
+
+        if self.color_threshold > 0:
+            saturation = cv2.inRange(hsv[:, :, 1], self.color_threshold, 255)
+            value = cv2.inRange(hsv[:, :, 2], self.color_threshold, 255)
+            red_mask = cv2.bitwise_and(red_mask, cv2.bitwise_and(saturation, value))
+
+        return red_mask
 
 
 def iou(box_a: Detection, box_b: Detection) -> float:

@@ -18,7 +18,6 @@ from src.tracker import SimpleTracker
 from src.video_io import create_video_writer, get_video_metadata, iter_video_frames
 from src.visualize import draw_tracks, save_json, serialize_frame_tracks
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Drone detection on panoramic video")
     parser.add_argument("--video", required=True, help="Path to input video")
@@ -27,12 +26,6 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="outputs",
         help="Output directory",
-    )
-    parser.add_argument(
-        "--background-alpha",
-        type=float,
-        default=None,
-        help="Override detector background update rate in (0, 1]. Bigger values forget old frames faster.",
     )
     parser.add_argument(
         "--use-cone-filter",
@@ -46,28 +39,18 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-
 def load_config(config_path: str | Path) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
-
-
-def build_detector(config: dict, background_alpha_override: float | None) -> ClassicalDroneDetector:
+def build_detector(config: dict) -> ClassicalDroneDetector:
     classical_cfg = dict(config.get("classical", {}))
-    if background_alpha_override is not None:
-        classical_cfg["background_alpha"] = background_alpha_override
     return ClassicalDroneDetector(**classical_cfg)
-
-
 
 def merge_detections(detections: list[Detection]) -> list[Detection]:
     if not detections:
         return []
     return non_max_suppression(detections, iou_threshold=0.3)
-
-
 
 def resolve_tracker_config(config: dict, args: argparse.Namespace) -> dict:
     tracker_cfg = dict(config.get("tracker", {}))
@@ -76,8 +59,6 @@ def resolve_tracker_config(config: dict, args: argparse.Namespace) -> dict:
     if args.disable_cone_filter:
         tracker_cfg["use_cone_filter"] = False
     return tracker_cfg
-
-
 
 def main() -> None:
     args = parse_args()
@@ -89,7 +70,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     video_stem = Path(args.video).stem
 
-    detector = build_detector(config, args.background_alpha)
+    detector = build_detector(config)
     tracker_cfg = resolve_tracker_config(config, args)
     tracker = SimpleTracker(**tracker_cfg)
 
@@ -118,22 +99,29 @@ def main() -> None:
 
             annotated = draw_tracks(frame, useful_tracks)
             writer.write(annotated)
-            frames_payload.append(serialize_frame_tracks(frame_idx, useful_tracks))
+            frames_payload.append(
+                serialize_frame_tracks(
+                    frame_idx,
+                    useful_tracks,
+                    frame_width=metadata["width"],
+                    frame_height=metadata["height"],
+                    fps=metadata["fps"],
+                )
+            )
     finally:
         writer.release()
 
     save_json(
         {
-            "video": str(Path(args.video)),
-            "method": method,
-            "metadata": metadata,
+            "video": {
+                "path": str(Path(args.video)),
+                "width": metadata["width"],
+                "height": metadata["height"],
+                "fps": metadata["fps"],
+                "frame_count": metadata["frame_count"],
+                "duration_sec": metadata["duration_sec"],
+            },
             "frames": frames_payload,
-            "classical": {
-                "background_alpha": detector.background_alpha,
-            },
-            "tracker": {
-                "use_cone_filter": tracker.use_cone_filter,
-            },
         },
         json_path,
     )
