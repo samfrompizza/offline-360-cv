@@ -14,7 +14,7 @@ classical:
 tracker:
   max_match_distance: 80.0
   min_iou_for_match: 0.01
-  max_missed_frames: 4
+  max_missed_frames: 3
   static_center_threshold: 4.0
   static_iou_threshold: 0.92
   static_frame_window: 8
